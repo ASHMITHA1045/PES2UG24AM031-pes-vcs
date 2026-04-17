@@ -23,7 +23,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
-
+#include "pes.h"
+#include <errno.h>
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 // Find an index entry by path (linear scan).
@@ -134,12 +135,49 @@ int index_status(const Index *index) {
 //   - hex_to_hash                      : converting the parsed string to ObjectID
 //
 // Returns 0 on success, -1 on error.
-int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+static int cmp_entries(const void *a, const void *b) {
+    const IndexEntry *ea = (const IndexEntry *)a;
+    const IndexEntry *eb = (const IndexEntry *)b;
+    return strcmp(ea->path, eb->path);
 }
+
+// ─────────────────────────────────────────────
+// LOAD INDEX
+int index_load(Index *index) {
+    index->count = 0;
+
+    FILE *fp = fopen(".pes/index", "r");
+    if (!fp) {
+        // If file doesn't exist → empty index (NOT error)
+        return 0;
+    }
+
+    while (1) {
+        IndexEntry entry;
+        char hash_hex[65];
+
+        int ret = fscanf(fp, "%o %64s %ld %ld %s\n",
+                         &entry.mode,
+                         hash_hex,
+                         &entry.mtime_sec,
+                         &entry.size,
+                         entry.path);
+
+        if (ret == EOF) break;
+        if (ret != 5) {
+            fclose(fp);
+            return -1;
+        }
+
+        hex_to_hash(hash_hex, &entry.hash);
+
+        index->entries[index->count++] = entry;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
 
 // Save the index to .pes/index atomically.
 //
@@ -151,12 +189,38 @@ int index_load(Index *index) {
 //   - rename                           : atomically moving the temp file over the old index
 //
 // Returns 0 on success, -1 on error.
+// SAVE INDEX (ATOMIC)
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    Index sorted = *index;
+
+    qsort(sorted.entries, sorted.count, sizeof(IndexEntry), cmp_entries);
+
+    FILE *fp = fopen(".pes/index.tmp", "w");
+    if (!fp) return -1;
+
+    for (int i = 0; i < sorted.count; i++) {
+        char hash_hex[65];
+        hash_to_hex(&sorted.entries[i].hash, hash_hex);
+
+        fprintf(fp, "%o %s %ld %ld %s\n",
+                sorted.entries[i].mode,
+                hash_hex,
+                sorted.entries[i].mtime_sec,
+                sorted.entries[i].size,
+                sorted.entries[i].path);
+    }
+
+    fflush(fp);
+    fsync(fileno(fp));
+    fclose(fp);
+
+    if (rename(".pes/index.tmp", ".pes/index") != 0) {
+        return -1;
+    }
+
+    return 0;
 }
+
 
 // Stage a file for the next commit.
 //
@@ -168,8 +232,52 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        perror("stat");
+        return -1;
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        perror("fopen");
+        return -1;
+    }
+
+    unsigned char *data = malloc(st.st_size);
+    if (!data) {
+        fclose(fp);
+        return -1;
+    }
+
+    fread(data, 1, st.st_size, fp);
+    fclose(fp);
+
+    ObjectID hash;
+    if (object_write(OBJ_BLOB, data, st.st_size, &hash) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+
+    IndexEntry *existing = index_find(index, path);
+
+    if (existing) {
+        existing->hash = hash;
+        existing->mtime_sec = st.st_mtime;
+        existing->size = st.st_size;
+        existing->mode = st.st_mode;
+    } else {
+        IndexEntry entry;
+        entry.hash = hash;
+        entry.mtime_sec = st.st_mtime;
+        entry.size = st.st_size;
+        entry.mode = st.st_mode;
+        strncpy(entry.path, path, sizeof(entry.path));
+
+        index->entries[index->count++] = entry;
+    }
+
+    return index_save(index);
 }
